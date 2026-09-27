@@ -328,7 +328,8 @@ static Language g_mainlang;
 static std::string g_lang_tag = "fa";
 
 static std::unique_ptr<Ort::Session> g_acoustic_session;
-static std::map<std::string, std::string> g_lexicon;   // word -> model phone tokens
+static std::map<std::string, std::string> g_lexicon_fa;  // word -> model phone tokens
+static std::map<std::string, std::string> g_lexicon_en;
 static std::unique_ptr<Ort::Session> g_vocoder_session;
 
 static bool load_all_models(const SynthConfig& cfg) {
@@ -356,9 +357,10 @@ static bool load_all_models(const SynthConfig& cfg) {
 
     g_lang_tag = (cfg.main_lang_str == "EN" || cfg.main_lang_str == "en") ? "en" : "fa";
     if (!cfg.lexicon_dir.empty()) {
-        g_lexicon = grain::loadInferenceLexicon(cfg.lexicon_dir, g_lang_tag);
-        std::cout << "Loaded " << g_lexicon.size() << " lexicon entries ("
-                  << g_lang_tag << ") from " << cfg.lexicon_dir << std::endl;
+        g_lexicon_fa = grain::loadInferenceLexicon(cfg.lexicon_dir, "fa");
+        g_lexicon_en = grain::loadInferenceLexicon(cfg.lexicon_dir, "en");
+        std::cout << "Loaded lexicons from " << cfg.lexicon_dir << ": fa "
+                  << g_lexicon_fa.size() << " entries, en " << g_lexicon_en.size() << std::endl;
     }
 
     std::cout << "Loading GrainSpeech acoustic model: " << cfg.acoustic_model << std::endl;
@@ -405,6 +407,12 @@ static SynthResult synthesize(const SynthConfig& cfg, const std::string& text,
     SynthResult result;
     auto t_total_start = std::chrono::high_resolution_clock::now();
 
+    // the language can change per request (daemon serves FA and EN)
+    g_lang_tag = (cfg.main_lang_str == "EN" || cfg.main_lang_str == "en") ? "en" : "fa";
+    g_mainlang = LanguageDetector::string_to_language(cfg.main_lang_str);
+    const std::map<std::string, std::string>& lexicon =
+        (g_lang_tag == "en") ? g_lexicon_en : g_lexicon_fa;
+
     std::string normalized_text;
     std::string ipa_text;
 
@@ -427,7 +435,7 @@ static SynthResult synthesize(const SynthConfig& cfg, const std::string& text,
     // --- GrainSpeech acoustic model: NormalizeText phones -> mel ---
     if (cfg.debug) std::cout << "\n=== GrainSpeech acoustic model ===" << std::endl;
 
-    std::string phone_str = grain::toModelPhones(normalized_text, ipa_text, g_lexicon, g_lang_tag);
+    std::string phone_str = grain::toModelPhones(normalized_text, ipa_text, lexicon, g_lang_tag);
     std::vector<std::string> phones;
     {
         std::istringstream ss(phone_str);
@@ -791,6 +799,8 @@ static int run_client(const SynthConfig& cfg, const std::string& text,
     std::string request = "{\"text\":" + json_str(text);
     if (!output_path.empty()) request += ",\"output\":" + json_str(output_path);
     request += ",\"speed\":" + std::to_string(cfg.speed);
+    request += ",\"main_lang\":" + json_str(cfg.main_lang_str);      // the daemon serves FA and EN
+    request += ",\"sample_rate\":" + std::to_string(cfg.sample_rate);
     request += "}";
     if (!write_line(fd, request)) { std::cerr << "Error: failed to send\n"; close(fd); return 1; }
     std::string response = read_line(fd, 30);

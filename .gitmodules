@@ -1,0 +1,4 @@
+[submodule "NormalizeText"]
+	path = NormalizeText
+	url = git@github.com:mah92/NormalizeText.git
+	branch = android
