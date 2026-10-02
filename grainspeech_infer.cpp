@@ -345,7 +345,16 @@ static bool load_all_models(const SynthConfig& cfg) {
 
     g_env.reset(new Ort::Env(ORT_LOGGING_LEVEL_WARNING, "tts_infer"));
     g_session_opts.SetIntraOpNumThreads(4);
+#if defined(__ANDROID__)
+    // ANDROID (SalamTTS, ORT 1.18): ANY graph optimization >= BASIC makes
+    // libonnxruntime SIGBUS (BUS_ADRALN) during session creation for this model
+    // family on ARMv7 — the exact failure the app's matcha / shakkelha / ezafe
+    // sessions had to be fixed for (ADR-014 / ADR-031). The desktop build keeps
+    // ORT_ENABLE_ALL (it is validated there and is faster).
+    g_session_opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_DISABLE_ALL);
+#else
     g_session_opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+#endif
     // Keep resident memory bounded: without these, ORT's CPU arena holds all
     // intermediate activations and never returns memory to the OS (~4 GB RSS).
     g_session_opts.DisableCpuMemArena();
