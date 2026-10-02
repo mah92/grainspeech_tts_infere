@@ -399,6 +399,36 @@ static bool load_all_models(const SynthConfig& cfg) {
 }
 
 // ============================================================================
+// Speed control
+// ============================================================================
+// GrainSpeech has NO length-scale input: the durations come from its own duration head, so a
+// speed factor cannot be fed to the acoustic model (unlike Matcha's `scales`). It is applied to
+// the mel along the TIME axis instead — the same recipe the Python pipeline uses
+// (synthesize_fa16k.py: stretch_time, ratio = 1/speed), i.e. linear interpolation of the mel
+// rows. Frames become `1/speed` times as many, so speed 1.6 speaks 1.6x faster and the pitch is
+// unchanged (this is why it is an interpolation and NOT a resample of the waveform).
+static std::vector<float> stretch_mel_time(const std::vector<float>& mel, int64_t n_mels,
+                                           int64_t frames, float speed) {
+    if (speed <= 0.0f || std::fabs(speed - 1.0f) < 0.01f || frames < 2) return mel;
+    int64_t new_frames = static_cast<int64_t>(std::llround(static_cast<double>(frames) / speed));
+    if (new_frames < 2) new_frames = 2;
+    std::vector<float> out(static_cast<size_t>(n_mels) * static_cast<size_t>(new_frames), 0.0f);
+    for (int64_t t = 0; t < new_frames; ++t) {
+        double src = static_cast<double>(t) * static_cast<double>(speed);
+        if (src > static_cast<double>(frames - 1)) src = static_cast<double>(frames - 1);
+        int64_t i0 = static_cast<int64_t>(src);
+        int64_t i1 = (i0 + 1 < frames) ? (i0 + 1) : i0;
+        float frac = static_cast<float>(src - static_cast<double>(i0));
+        for (int64_t m = 0; m < n_mels; ++m) {
+            float a = mel[static_cast<size_t>(m) * frames + i0];
+            float b = mel[static_cast<size_t>(m) * frames + i1];
+            out[static_cast<size_t>(m) * new_frames + t] = a + (b - a) * frac;
+        }
+    }
+    return out;
+}
+
+// ============================================================================
 // Core synthesis
 // ============================================================================
 static SynthResult synthesize(const SynthConfig& cfg, const std::string& text,
@@ -488,6 +518,16 @@ static SynthResult synthesize(const SynthConfig& cfg, const std::string& text,
         for (int64_t t2 = 0; t2 < mel_frames; ++t2)
             mel_t[i * mel_frames + t2] = mel_raw[t2 * n_mels + i];
     float* mel_data = mel_t.data();
+
+    // Speed: resample the mel along time (see stretch_mel_time above). Done BEFORE the vocoder
+    // and without touching cfg.speed's meaning for the rest of the pipeline.
+    static std::vector<float> mel_speed;
+    if (cfg.speed > 0.0f && std::fabs(cfg.speed - 1.0f) >= 0.01f) {
+        mel_speed = stretch_mel_time(mel_t, n_mels, mel_frames, cfg.speed);
+        mel_frames = static_cast<int64_t>(mel_speed.size() / static_cast<size_t>(n_mels));
+        mel_data = mel_speed.data();
+        if (cfg.debug) std::cout << "Speed " << cfg.speed << " -> mel frames " << mel_frames << std::endl;
+    }
 
     // --- Vocos vocoder inference (k2-fsa vocos-22khz-univ: mels → mag/x/y) ---
     if (cfg.debug) std::cout << "\n=== Vocoder Inference ===" << std::endl;
