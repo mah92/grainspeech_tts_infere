@@ -112,6 +112,190 @@ static int read_token_map(const std::string& filepath,
 // ============================================================================
 // Phone tokens (already in the model's convention) -> symbol ids
 // ============================================================================
+// ---------------------------------------------------------------------------
+// Phone normalization for the model inventory (Ali 2026-10-02).
+//
+// Words that are NOT in the lexicon fall back to espeak-ng's IPA, and espeak
+// emits phones this model's alphabet does not carry: the near-close central
+// vowel ᵻ, the tap ɾ, ɐ/ɒ, a bare long ɑː, and diphthongs that espeak splits
+// into two tokens ("ˌe" + "ɪ" for eɪ). Those phones were silently SKIPPED by
+// phones_to_ids, which truncated words on-device: TalkBack's «double tap to
+// activate» reached the ear as «activ» because ᵻ and ˌe vanished.
+//
+// Each unknown phone is mapped onto the nearest symbol the model actually
+// carries (this symbol table has 69 English / 74 Persian phone symbols).
+// Anything still unknown is left in place and reported exactly as before.
+// ---------------------------------------------------------------------------
+static std::vector<std::string> normalize_phones_for_inventory(
+        const std::vector<std::string>& in,
+        const std::map<std::string, int>& token_to_id) {
+    // NOTE: symbol-table keys carry the leading '@' (phones_to_ids adds it), so
+    // every lookup here must add it too — forgetting this made the whole
+    // normalization a silent no-op on the first attempt.
+    auto has = [&](const std::string& k) {
+        std::string key = (!k.empty() && k[0] == '@') ? k : ("@" + k);
+        return token_to_id.find(key) != token_to_id.end();
+    };
+    auto split_prefix = [](const std::string& p, std::string& prefix, std::string& core) {
+        size_t c = p.find(':');
+        if (c == std::string::npos) { prefix.clear(); core = p; }
+        else { prefix = p.substr(0, c + 1); core = p.substr(c + 1); }
+    };
+    // strip leading primary ˈ (U+02C8 = CB 88) / secondary ˌ (U+02CC = CB 8C) marks
+    auto split_stress = [](const std::string& core, std::string& stress, std::string& rest) {
+        stress.clear();
+        rest = core;
+        for (;;) {
+            if (rest.size() >= 2
+                && static_cast<unsigned char>(rest[0]) == 0xCB
+                && (static_cast<unsigned char>(rest[1]) == 0x88
+                    || static_cast<unsigned char>(rest[1]) == 0x8C)) {
+                stress += rest.substr(0, 2);
+                rest.erase(0, 2);
+            } else {
+                break;
+            }
+        }
+    };
+
+    const std::string V_A = "a", V_E = "e", V_O = "o", V_I = "i", V_U = "u";
+    const std::string V_OPEN_O = "\xC9\x94";        // ɔ
+    const std::string P_I = "\xC9\xAA";             // ɪ
+    const std::string P_U = "\xCA\x8A";             // ʊ
+    const std::string P_SCHWA = "\xC9\x99";         // ə
+    const std::string P_LEN = "\xCB\x90";           // ː
+    const std::string S_PRIMARY = "\xCB\x88";       // ˈ
+    const std::string S_SECONDARY = "\xCB\x8C";     // ˌ
+
+    std::vector<std::string> out;
+    for (size_t i = 0; i < in.size(); ++i) {
+        std::string prefix, core;
+        split_prefix(in[i], prefix, core);
+        std::string stress, rest;
+        split_stress(core, stress, rest);
+
+        // 1) already a symbol the model knows
+        if (has(in[i])) { out.push_back(in[i]); continue; }
+
+        // 2) an espeak-split diphthong: ("ˈa","ɪ") -> "ˈaɪ", ("ˌe","ɪ") -> "ˌeɪ"
+        bool is_vowel_letter = (rest == V_A || rest == V_E || rest == V_O
+                                || rest == V_I || rest == V_U || rest == V_OPEN_O);
+        if (is_vowel_letter && i + 1 < in.size()) {
+            std::string np, ncore;
+            split_prefix(in[i + 1], np, ncore);
+            std::string nstress, nrest;
+            split_stress(ncore, nstress, nrest);
+            if (np == prefix && (nstress.empty() || nstress == stress)
+                && (nrest == P_I || nrest == P_U)) {
+                std::string merged = prefix + stress + rest + nrest;
+                if (has(merged)) { out.push_back(merged); ++i; continue; }
+                std::string bare = prefix + rest + nrest;
+                if (has(bare)) { out.push_back(bare); ++i; continue; }
+            }
+        }
+
+        // 3) near-miss substitutions (stress-preserving form first)
+        static const char* kSubs[][2] = {
+            {"\xE1\xB5\xBB", "\xC9\xAA"},                    // ᵻ  -> ɪ
+            {"\xC9\xA8",     "\xC9\xAA"},                    // ɨ  -> ɪ
+            {"\xC9\xBE",     "\xC9\xB9"},                    // ɾ  -> ɹ
+            {"r",            "\xC9\xB9"},                    // r  -> ɹ
+            {"\xC9\x90",     "\xC9\x99"},                    // ɐ  -> ə
+            {"\xC9\x92",     "\xC9\x94"},                    // ɒ  -> ɔ
+            {"\xCA\x8C",     "\xC9\x99"},                    // ʌ  -> ə
+            {"\xC9\x9C",     "\xC9\x9C\xCB\x90"},            // ɜ  -> ɜː
+            {"\xC9\x9A",     "\xC9\x99"},                    // ɚ  -> ə
+            {"\xC9\x9D",     "\xC9\x9C\xCB\x90"},            // ɝ  -> ɜː
+        };
+        if (rest.size() <= 3) {
+            bool done = false;
+            for (const auto& sub : kSubs) {
+                if (rest == sub[0]) {
+                    std::string cand = prefix + stress + sub[1];
+                    if (has(cand)) { out.push_back(cand); done = true; break; }
+                    std::string cand2 = prefix + sub[1];
+                    if (has(cand2)) { out.push_back(cand2); done = true; break; }
+                }
+            }
+            if (done) continue;
+        }
+
+        // 4) drop a trailing length mark (ɑː -> ɑ where only the short form exists)
+        if (rest.size() > 2 && rest.compare(rest.size() - 2, 2, P_LEN) == 0) {
+            std::string stripped = rest.substr(0, rest.size() - 2);
+            std::string cand = prefix + stress + stripped;
+            if (has(cand)) { out.push_back(cand); continue; }
+            std::string cand2 = prefix + stripped;
+            if (has(cand2)) { out.push_back(cand2); continue; }
+            std::string cand3 = prefix + stripped + P_LEN;
+            if (has(cand3)) { out.push_back(cand3); continue; }
+        }
+
+        // 5) a secondary-stressed vowel that only exists unstressed (ˌo -> o)
+        if (stress == S_SECONDARY) {
+            std::string bare = prefix + rest;
+            if (has(bare)) { out.push_back(bare); continue; }
+        }
+
+        // 6) split a vowel+schwa sequence (ɪə -> ɪ + ə) when both halves exist
+        if (rest.size() > 2 && rest.compare(rest.size() - 2, 2, P_SCHWA) == 0) {
+            std::string head = rest.substr(0, rest.size() - 2);
+            if (has(prefix + head) && has(prefix + P_SCHWA)) {
+                out.push_back(prefix + stress + head);
+                out.push_back(prefix + P_SCHWA);
+                continue;
+            }
+        }
+
+        // 7) STRIP_DIACRITICS: drop phonetic diacritics (palatalisation ʲ,
+        //    aspiration ʰ, nasalisation ̃, syllabic ̩ …) and retry — espeak emits
+        //    them for foreign words/URLs and the model's alphabet has none of them.
+        {
+            std::string stripped;
+            for (size_t k = 0; k < rest.size();) {
+                size_t len = 1;
+                unsigned char c0 = static_cast<unsigned char>(rest[k]);
+                if ((c0 & 0xE0) == 0xC0) len = 2;
+                else if ((c0 & 0xF0) == 0xE0) len = 3;
+                else if ((c0 & 0xF8) == 0xF0) len = 4;
+                if (k + len > rest.size()) len = 1;
+                std::string cp = rest.substr(k, len);
+                k += len;
+                static const char* kDiacritics[] = {
+                    "\xCA\xB0",  // ʰ
+                    "\xCA\xB2",  // ʲ
+                    "\xCA\xB7",  // ʷ
+                    "\xCB\xA4",  // ˤ
+                    "\xCB\xA0",  // ˠ
+                    "\xCB\x80",  // ˀ
+                    "\xCC\xA9",  // ̩
+                    "\xCC\xAF",  // ̯
+                    "\xCC\x83",  // ̃
+                    "\xCC\xA5",  // ̥
+                    "\xCA\xB1",  // ʱ
+                    "\xCA\xA1"   // ˡ
+                };
+                bool drop = false;
+                for (const char* d : kDiacritics) {
+                    if (cp == d) { drop = true; break; }
+                }
+                if (!drop) stripped += cp;
+            }
+            if (!stripped.empty() && stripped != rest) {
+                std::string cand = prefix + stress + stripped;
+                if (has(cand)) { out.push_back(cand); continue; }
+                std::string cand2 = prefix + stripped;
+                if (has(cand2)) { out.push_back(cand2); continue; }
+            }
+        }
+
+        // 8) still unknown — keep it; phones_to_ids reports and skips it
+        out.push_back(in[i]);
+        (void)S_PRIMARY;
+    }
+    return out;
+}
+
 static std::vector<int64_t> phones_to_ids(const std::vector<std::string>& phones,
                                           const std::map<std::string, int>& token_to_id,
                                           int& missing) {
@@ -480,6 +664,14 @@ static SynthResult synthesize(const SynthConfig& cfg, const std::string& text,
         std::istringstream ss(phone_str);
         std::string tk;
         while (ss >> tk) phones.push_back(tk);
+    }
+    // map espeak-only phones onto symbols the model carries, so a word is not
+    // silently truncated by a missing symbol (see the function above)
+    phones = normalize_phones_for_inventory(phones, g_token_to_id);
+    if (cfg.debug) {
+        std::string np;
+        for (size_t k = 0; k < phones.size(); ++k) { if (k) np += " "; np += phones[k]; }
+        std::cout << "Phones (normalized):" << np << std::endl;
     }
     int missing = 0;
     std::vector<int64_t> token_ids = phones_to_ids(phones, g_token_to_id, missing);
