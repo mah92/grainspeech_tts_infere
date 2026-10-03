@@ -115,7 +115,7 @@ static int read_token_map(const std::string& filepath,
 // ---------------------------------------------------------------------------
 // Phone normalization for the model inventory (Ali 2026-10-02).
 //
-// Words that are NOT in the lexicon fall back to espeak-ng's IPA, and espeak
+// Every word is phonemized by espeak-ng (there is no lexicon any more), and espeak
 // emits phones this model's alphabet does not carry: the near-close central
 // vowel ᵻ, the tap ɾ, ɐ/ɒ, a bare long ɑː, and diphthongs that espeak splits
 // into two tokens ("ˌe" + "ɪ" for eɪ). Those phones were silently SKIPPED by
@@ -461,7 +461,6 @@ static std::string json_get_str(const std::string& json, const std::string& key)
 struct SynthConfig {
     std::string acoustic_model;   // GrainSpeech phones -> mel (exported ONNX)
     std::string symbols_file;     // symbol table, one token per line (line number = id)
-    std::string lexicon_dir;      // infer_lex_fa.txt / infer_lex_en.txt for the phone conversion
     std::string vocoder_model;
     std::string tokens_file;
     std::string espeak_data;
@@ -512,8 +511,6 @@ static Language g_mainlang;
 static std::string g_lang_tag = "fa";
 
 static std::unique_ptr<Ort::Session> g_acoustic_session;
-static std::map<std::string, std::string> g_lexicon_fa;  // word -> model phone tokens
-static std::map<std::string, std::string> g_lexicon_en;
 static std::unique_ptr<Ort::Session> g_vocoder_session;
 
 static bool load_all_models(const SynthConfig& cfg) {
@@ -549,13 +546,6 @@ static bool load_all_models(const SynthConfig& cfg) {
     }
 
     g_lang_tag = (cfg.main_lang_str == "EN" || cfg.main_lang_str == "en") ? "en" : "fa";
-    if (!cfg.lexicon_dir.empty()) {
-        g_lexicon_fa = grain::loadInferenceLexicon(cfg.lexicon_dir, "fa");
-        g_lexicon_en = grain::loadInferenceLexicon(cfg.lexicon_dir, "en");
-        std::cout << "Loaded lexicons from " << cfg.lexicon_dir << ": fa "
-                  << g_lexicon_fa.size() << " entries, en " << g_lexicon_en.size() << std::endl;
-    }
-
     std::cout << "Loading GrainSpeech acoustic model: " << cfg.acoustic_model << std::endl;
     try {
         g_acoustic_session.reset(new Ort::Session(*g_env, cfg.acoustic_model.c_str(), g_session_opts));
@@ -633,9 +623,6 @@ static SynthResult synthesize(const SynthConfig& cfg, const std::string& text,
     // the language can change per request (daemon serves FA and EN)
     g_lang_tag = (cfg.main_lang_str == "EN" || cfg.main_lang_str == "en") ? "en" : "fa";
     g_mainlang = LanguageDetector::string_to_language(cfg.main_lang_str);
-    const std::map<std::string, std::string>& lexicon =
-        (g_lang_tag == "en") ? g_lexicon_en : g_lexicon_fa;
-
     std::string normalized_text;
     std::string ipa_text;
 
@@ -658,7 +645,7 @@ static SynthResult synthesize(const SynthConfig& cfg, const std::string& text,
     // --- GrainSpeech acoustic model: NormalizeText phones -> mel ---
     if (cfg.debug) std::cout << "\n=== GrainSpeech acoustic model ===" << std::endl;
 
-    std::string phone_str = grain::toModelPhones(normalized_text, ipa_text, lexicon, g_lang_tag);
+    std::string phone_str = grain::toModelPhones(normalized_text, ipa_text, g_lang_tag);
     std::vector<std::string> phones;
     {
         std::istringstream ss(phone_str);
@@ -1076,7 +1063,6 @@ static void print_usage(const char* prog) {
               << "    --model <path>              GrainSpeech acoustic model ONNX (phones -> mel)\n"
               << "    --vocoder-model <path>      Vocos ONNX (mels -> mag/x/y)\n"
               << "    --symbols <path>            Symbol table (one token per line, line no. = id)\n"
-              << "    --lexicon-dir <dir>         infer_lex_fa.txt / infer_lex_en.txt for the phone conversion\n"
               << "    --espeak-data <path>        espeak-ng-data directory\n"
               << "    --ezafe-onnx <path>         Ezafe model ONNX path\n"
               << "    --ezafe-spiece <path>       Ezafe sentencepiece model path\n"
@@ -1143,7 +1129,6 @@ int main(int argc, char* argv[]) {
         else if (arg == "--vocoder-model") cfg.vocoder_model = require_val("--vocoder-model");
         else if (arg == "--symbols")       { cfg.symbols_file = require_val("--symbols");
                                              cfg.tokens_file = cfg.symbols_file; }
-        else if (arg == "--lexicon-dir")   cfg.lexicon_dir = require_val("--lexicon-dir");
         else if (arg == "--espeak-data")   cfg.espeak_data = require_val("--espeak-data");
         else if (arg == "--ezafe-onnx")    cfg.ezafe_onnx = require_val("--ezafe-onnx");
         else if (arg == "--ezafe-spiece")  cfg.ezafe_spiece = require_val("--ezafe-spiece");
