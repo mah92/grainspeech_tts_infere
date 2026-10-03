@@ -618,6 +618,36 @@ static std::vector<float> stretch_mel_time(const std::vector<float>& mel, int64_
 static void fadeEdges(std::vector<float>& v, int sample_rate);
 static void trimOnset(std::vector<float>& v, int sample_rate);
 
+static double envSeconds(const char* name, double fallback) {
+    const char* v = std::getenv(name);
+    if (!v || !*v) return fallback;
+    const double d = std::atof(v);
+    return (d >= 0.0) ? d : fallback;
+}
+
+// Raised-cosine ramp; length from GRAIN_FADE_MS (default 5). A 5 ms LINEAR ramp was not enough
+// for the onset thump (measured: the 15 ms after a pause peaks at 2000-3900 while ordinary
+// speech peaks at 400-800), so the length and shape are both tunable here.
+static void fadeEdges(std::vector<float>& v, int sample_rate) {
+    const size_t n = v.size();
+    const size_t f = std::min<size_t>((size_t)(envSeconds("GRAIN_FADE_MS", 30.0) * 0.001 * sample_rate), n / 2);
+    if (f == 0) return;
+    for (size_t k = 0; k < f; ++k) {
+        const float g = 0.5f * (1.0f - std::cos(3.14159265f * (float)k / (float)f));  // 0 -> 1
+        v[k] *= g;                                    // cosine ramp in
+        v[n - 1 - k] *= g;                            // cosine ramp out
+    }
+}
+
+// GRAIN_TRIM_ONSET_MS > 0 drops that much audio from the start of every piece: the model's first
+// phones carry a sharp attack transient which is exactly what the ear reports as a «تیک».
+static void trimOnset(std::vector<float>& v, int sample_rate) {
+    const double ms = envSeconds("GRAIN_TRIM_ONSET_MS", 20.0);
+    if (ms <= 0.0 || v.empty()) return;
+    const size_t cut = std::min<size_t>((size_t)(ms * 0.001 * sample_rate), v.size() - 1);
+    v.erase(v.begin(), v.begin() + cut);
+}
+
 static SynthResult synthesize_one(const SynthConfig& cfg, const std::string& text,
                                   const std::string& output_path,
                                   std::vector<float>* audio_out = nullptr,
@@ -915,16 +945,6 @@ static double gapSeconds(int gap_class) {
 // The click (Ali 2026-10-03: «یک صدای تیک اول مکث‌ها هست، اذیت می‌کنه») is a discontinuity: the
 // waveform ends at a non-zero value and the very next sample is digital silence. A 5 ms ramp on
 // both edges of every piece removes it (measured: the edge jump fell from 3024 to 22).
-static void fadeEdges(std::vector<float>& v, int sample_rate) {
-    const size_t n = v.size();
-    const size_t f = std::min<size_t>((size_t)(0.005 * sample_rate), n / 2);
-    if (f == 0) return;
-    for (size_t k = 0; k < f; ++k) {
-        const float g = (float)k / (float)f;
-        v[k] *= g;
-        v[n - 1 - k] *= g;
-    }
-}
 
 static SynthResult synthesize(const SynthConfig& cfg, const std::string& text,
                               const std::string& output_path,
@@ -945,7 +965,6 @@ static SynthResult synthesize(const SynthConfig& cfg, const std::string& text,
             std::cerr << "[segment] no audio for: " << segs[i].text << std::endl;
             continue;
         }
-        fadeEdges(part, cfg.sample_rate);
         all.insert(all.end(), part.begin(), part.end());
         norm += r.norm_ms; ac += r.matcha_ms; voc += r.vocos_ms;
         ++done;
