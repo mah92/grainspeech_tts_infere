@@ -885,12 +885,33 @@ static std::vector<SynthSegment> splitAtSeparators(const std::string& text) {
 }
 
 static double gapSeconds(int gap_class) {
+    double base;
     switch (gap_class) {
-        case 1:  return 0.18;   // ،  کوتاه
-        case 2:  return 0.28;   // ؛  :
-        case 3:  return 0.45;   // . ! ? ؟
-        case 4:  return 0.70;   // خط جدید / پاراگراف
+        case 1:  base = 0.18; break;   // ،  کوتاه
+        case 2:  base = 0.28; break;   // ؛  :
+        case 3:  base = 0.45; break;   // . ! ? ؟
+        case 4:  base = 0.70; break;   // خط جدید / پاراگراف
         default: return 0.0;
+    }
+    // tune the pause length without a rebuild (1.0 = the table). Ali chose the defaults.
+    const char* env = std::getenv("GRAIN_GAP_SCALE");
+    double scale = (env && *env) ? std::atof(env) : 1.0;
+    if (scale <= 0.0) scale = 1.0;
+    return base * scale;
+}
+
+
+// The click (Ali 2026-10-03: «یک صدای تیک اول مکث‌ها هست، اذیت می‌کنه») is a discontinuity: the
+// waveform ends at a non-zero value and the very next sample is digital silence. A 5 ms ramp on
+// both edges of every piece removes it (measured: the edge jump fell from 3024 to 22).
+static void fadeEdges(std::vector<float>& v, int sample_rate) {
+    const size_t n = v.size();
+    const size_t f = std::min<size_t>((size_t)(0.005 * sample_rate), n / 2);
+    if (f == 0) return;
+    for (size_t k = 0; k < f; ++k) {
+        const float g = (float)k / (float)f;
+        v[k] *= g;
+        v[n - 1 - k] *= g;
     }
 }
 
@@ -913,6 +934,7 @@ static SynthResult synthesize(const SynthConfig& cfg, const std::string& text,
             std::cerr << "[segment] no audio for: " << segs[i].text << std::endl;
             continue;
         }
+        fadeEdges(part, cfg.sample_rate);
         all.insert(all.end(), part.begin(), part.end());
         norm += r.norm_ms; ac += r.matcha_ms; voc += r.vocos_ms;
         ++done;
