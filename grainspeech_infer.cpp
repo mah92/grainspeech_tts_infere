@@ -3,6 +3,10 @@
 #include "language_detector/language_detector.h"
 
 #include <onnxruntime_cxx_api.h>
+#if defined(__ANDROID__)
+#include <sys/system_properties.h>
+#include <android/log.h>
+#endif
 
 #include <iostream>
 #include <sstream>
@@ -29,6 +33,13 @@
 // ============================================================================
 // Global socket path
 // ============================================================================
+#if defined(__ANDROID__)
+#include <android/log.h>
+#define GRAIN_LOGI(...) __android_log_print(ANDROID_LOG_INFO, "SalamNativeGrain", __VA_ARGS__)
+#else
+#define GRAIN_LOGI(...) do { fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); } while (0)
+#endif
+
 static const char* SOCKET_PATH = "/tmp/grainspeech_infer.sock";   // never share the Matcha daemon socket
 
 // ============================================================================
@@ -532,14 +543,56 @@ static bool load_all_models(const SynthConfig& cfg) {
     // family on ARMv7 — the exact failure the app's matcha / shakkelha / ezafe
     // sessions had to be fixed for (ADR-014 / ADR-031). The desktop build keeps
     // ORT_ENABLE_ALL (it is validated there and is faster).
-    g_session_opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_DISABLE_ALL);
+    //
+    // 2026-10-03 (TalkBack investigation): the engine now returns nonsense on the
+    // device — the same text that yields 12 480 samples on the desktop comes back as
+    // 1 sample, or as millions of samples (2 170 555 / 3 858 763 / 5 551 056 recur
+    // for different inputs), while the identical model and code are correct on x86.
+    // That points at the ORT session configuration (optimization level and the
+    // disabled CPU memory arena / memory pattern) rather than at the model, so both
+    // are runtime-selectable:
+    //
+    //   adb shell setprop debug.grain.opt   0|1|2|3   (0=disable all, 3=enable all)
+    //   adb shell setprop debug.grain.arena 0|1       (1 = keep ORT's CPU arena)
+    //
+    // Defaults keep today's shipping behaviour (opt 0, arena disabled); a process
+    // restart (force-stop) is required because the session is built at init.
+    {
+        char buf[PROP_VALUE_MAX] = {0};
+        int lvl = 0;
+        if (__system_property_get("debug.grain.opt", buf) > 0) lvl = std::atoi(buf);
+        GraphOptimizationLevel gl = GraphOptimizationLevel::ORT_DISABLE_ALL;
+        switch (lvl) {
+            case 1: gl = GraphOptimizationLevel::ORT_ENABLE_BASIC; break;
+            case 2: gl = GraphOptimizationLevel::ORT_ENABLE_EXTENDED; break;
+            case 3: gl = GraphOptimizationLevel::ORT_ENABLE_ALL; break;
+            default: gl = GraphOptimizationLevel::ORT_DISABLE_ALL; break;
+        }
+        g_session_opts.SetGraphOptimizationLevel(gl);
+        char ab[PROP_VALUE_MAX] = {0};
+        // DEFAULT IS TO KEEP THE ARENA (device finding, 2026-10-03): with the CPU arena and the
+        // memory pattern DISABLED (the old memory-driven default) every synthesis after the first
+        // returned 1 sample even when the vocoder session was rebuilt — while the identical model
+        // and code are correct on x86. The run that produced 19 200 / 20 992 / 21 760 samples had
+        // cpu-arena=1, so the defaults now follow ORT (arena and memory pattern ON) and the
+        // memory-bounded behaviour is only used when explicitly requested with
+        // debug.grain.arena 0.
+        int arena = 1;
+        if (__system_property_get("debug.grain.arena", ab) > 0) arena = std::atoi(ab);
+        if (!arena) {
+            // Keep resident memory bounded: without these, ORT's CPU arena holds all
+            // intermediate activations and never returns memory to the OS (~4 GB RSS).
+            g_session_opts.DisableCpuMemArena();
+            g_session_opts.DisableMemPattern();
+        }
+        __android_log_print(ANDROID_LOG_INFO, "SalamNativeGrain",
+                            "ORT session: opt-level=%d cpu-arena=%d", lvl, arena);
+    }
 #else
     g_session_opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
-#endif
-    // Keep resident memory bounded: without these, ORT's CPU arena holds all
-    // intermediate activations and never returns memory to the OS (~4 GB RSS).
     g_session_opts.DisableCpuMemArena();
     g_session_opts.DisableMemPattern();
+#endif
 
     if (read_token_map(cfg.symbols_file, g_token_to_id, g_id_to_token) != 0) {
         return false;
@@ -630,6 +683,7 @@ static double envSeconds(const char* name, double fallback) {
 // speech peaks at 400-800), so the length and shape are both tunable here.
 static void fadeEdges(std::vector<float>& v, int sample_rate) {
     const size_t n = v.size();
+    if (sample_rate <= 0) return;
     const size_t f = std::min<size_t>((size_t)(envSeconds("GRAIN_FADE_MS", 30.0) * 0.001 * sample_rate), n / 2);
     if (f == 0) return;
     for (size_t k = 0; k < f; ++k) {
@@ -644,7 +698,17 @@ static void fadeEdges(std::vector<float>& v, int sample_rate) {
 static void trimOnset(std::vector<float>& v, int sample_rate) {
     const double ms = envSeconds("GRAIN_TRIM_ONSET_MS", 20.0);
     if (ms <= 0.0 || v.empty()) return;
-    const size_t cut = std::min<size_t>((size_t)(ms * 0.001 * sample_rate), v.size() - 1);
+    if (sample_rate <= 0) return;                       // never guess a rate
+    const size_t wanted = (size_t)(ms * 0.001 * (double)sample_rate);
+    // Safety net (2026-10-03 device finding): a corrupted sample_rate once made this erase the
+    // whole piece — the engine then returned 1 sample, the screen reader heard nothing and the
+    // app was blamed. A trim of a quarter of the audio or more is never legitimate: skip it.
+    if (wanted * 4 >= v.size()) {
+        GRAIN_LOGI("trimOnset skipped: wanted=%d samples of %d (sample_rate=%d)",
+                   (int)wanted, (int)v.size(), sample_rate);
+        return;
+    }
+    const size_t cut = std::min<size_t>(wanted, v.size() - 1);
     v.erase(v.begin(), v.begin() + cut);
 }
 
@@ -706,6 +770,8 @@ static SynthResult synthesize_one(const SynthConfig& cfg, const std::string& tex
         std::cerr << "Error: no phone tokens produced for this text" << std::endl;
         return result;
     }
+    GRAIN_LOGI("model input: text=%d bytes phones=%d token_ids=%d unknown=%d",
+               (int)text.size(), (int)phones.size(), (int)token_ids.size(), missing);
     int64_t seq_len = static_cast<int64_t>(token_ids.size());
 
     std::vector<int64_t> x_shape = {1, seq_len};
@@ -730,6 +796,7 @@ static SynthResult synthesize_one(const SynthConfig& cfg, const std::string& tex
     }
     int64_t mel_frames = mel_shape_raw[1];
     int64_t n_mels = mel_shape_raw[2];
+    GRAIN_LOGI("acoustic output: mel frames=%d n_mels=%d", (int)mel_frames, (int)n_mels);
     const float* mel_raw = ac_outputs[0].GetTensorData<float>();
     if (cfg.debug)
         std::cout << "Mel: [" << mel_shape_raw[0] << ", " << mel_frames << ", " << n_mels << "]" << std::endl;
@@ -831,15 +898,29 @@ static SynthResult synthesize_one(const SynthConfig& cfg, const std::string& tex
                   << "] (n_fft=" << n_fft << ", hop=" << hop << ")" << std::endl;
     }
 
+    GRAIN_LOGI("vocoder output: frames=%d n_bins=%d n_fft=%d", (int)vocos_frames, n_bins, n_fft);
     std::vector<float> audio = vocos_istft(mag_data, x_data, y_data,
                                            n_fft, hop, (int)vocos_frames);
+    GRAIN_LOGI("istft: samples=%d (vocoder frames=%d hop=%d n_fft=%d)",
+               (int)audio.size(), (int)vocos_frames, hop, n_fft);
 
     // Ali approved the «پ» sample (2026-10-03): the model's first phones carry a sharp attack
     // transient which the ear reports as a «تیک», so every synthesized piece gets a 20 ms onset
     // trim and a 30 ms raised-cosine ramp at both ends. Done HERE so all callers behave alike —
     // including the screen-reader path, where each sentence is its own native call.
-    trimOnset(audio, cfg.sample_rate);
-    fadeEdges(audio, cfg.sample_rate);
+    // The config's sample_rate has been seen corrupted at runtime on the device (values like
+    // 6029312 / -292686848) while the engine itself synthesizes at 16 kHz. Validate it instead of
+    // trusting it: a bad rate only ever produces a bad trim.
+    const int eff_rate = (cfg.sample_rate >= 8000 && cfg.sample_rate <= 48000) ? cfg.sample_rate : 16000;
+    if (eff_rate != cfg.sample_rate) {
+        GRAIN_LOGI("WARNING: cfg.sample_rate=%d is out of range — using %d for trim/fade",
+                   cfg.sample_rate, eff_rate);
+    }
+    trimOnset(audio, eff_rate);
+    fadeEdges(audio, eff_rate);
+    GRAIN_LOGI("after trim/fade: samples=%d (sr=%d, trim_ms=%.1f, fade_ms=%.1f)",
+               (int)audio.size(), cfg.sample_rate,
+               envSeconds("GRAIN_TRIM_ONSET_MS", 20.0), envSeconds("GRAIN_FADE_MS", 30.0));
     int64_t num_samples = (int64_t)audio.size();
     if (cfg.debug) std::cout << "Wave shape: [1, " << num_samples << "]" << std::endl;
 
