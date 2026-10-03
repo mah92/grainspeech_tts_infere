@@ -614,9 +614,10 @@ static std::vector<float> stretch_mel_time(const std::vector<float>& mel, int64_
 // ============================================================================
 // Core synthesis
 // ============================================================================
-static SynthResult synthesize(const SynthConfig& cfg, const std::string& text,
-                               const std::string& output_path,
-                               std::vector<float>* audio_out = nullptr) {
+static SynthResult synthesize_one(const SynthConfig& cfg, const std::string& text,
+                                  const std::string& output_path,
+                                  std::vector<float>* audio_out = nullptr,
+                                  bool quiet = false) {
     SynthResult result;
     auto t_total_start = std::chrono::high_resolution_clock::now();
 
@@ -814,17 +815,135 @@ static SynthResult synthesize(const SynthConfig& cfg, const std::string& text,
     result.total_ms = std::chrono::duration<double, std::milli>(
         std::chrono::high_resolution_clock::now() - t_total_start).count();
 
-    if (cfg.debug) std::cout << "\n=== Done ===" << std::endl;
-    if (!audio_out) std::cout << "Output: " << result.output_path << std::endl;
-    std::cout << "Duration: " << result.duration_secs << "s" << std::endl;
+    if (!quiet) {
+        if (cfg.debug) std::cout << "\n=== Done ===" << std::endl;
+        if (!audio_out) std::cout << "Output: " << result.output_path << std::endl;
+        std::cout << "Duration: " << result.duration_secs << "s" << std::endl;
 
-    fprintf(stderr, "\n[TIMING] ===== Summary =====\n");
-    fprintf(stderr, "[TIMING] NormalizeText : %.1f ms\n", result.norm_ms);
-    fprintf(stderr, "[TIMING] MatchaTTS      : %.1f ms\n", result.matcha_ms);
-    fprintf(stderr, "[TIMING] Vocos          : %.1f ms\n", result.vocos_ms);
-    fprintf(stderr, "[TIMING] Total           : %.1f ms\n", result.total_ms);
+        fprintf(stderr, "\n[TIMING] ===== Summary =====\n");
+        fprintf(stderr, "[TIMING] NormalizeText : %.1f ms\n", result.norm_ms);
+        fprintf(stderr, "[TIMING] MatchaTTS      : %.1f ms\n", result.matcha_ms);
+        fprintf(stderr, "[TIMING] Vocos          : %.1f ms\n", result.vocos_ms);
+        fprintf(stderr, "[TIMING] Total           : %.1f ms\n", result.total_ms);
+    }
 
     return result;
+}
+
+
+// ============================================================================
+// Ali 2026-10-03: «متن بین جداکنندهها باید مستقل تبدیل به گفتار بشه» — the text between two
+// separators is converted to speech on its OWN: own NormalizeText, own phone run, own model
+// run. The pieces are joined with silence whose length follows the separator kind, because the
+// model cannot produce silence itself (its alphabet is phones only, no silence symbol).
+//
+// There is deliberately NO character cap here (Ali: «سقف نباید بگذاری… وگرنه یک بخش از متن
+// حذف میشه»): only real separators end a piece, so no part of the text can be dropped. The
+// screen-reader path in the app does have a safety chunk size, and there it breaks at the last
+// word boundary instead of mid-word.
+// ============================================================================
+struct SynthSegment {
+    std::string text;
+    int gap_class;   // 0 = end of text, 1 = comma, 2 = semicolon/colon, 3 = sentence end, 4 = newline
+};
+
+static std::vector<SynthSegment> splitAtSeparators(const std::string& text) {
+    std::vector<SynthSegment> out;
+    std::string cur;
+    auto flush = [&](int gap) {
+        const char* ws = " \t\r\n";
+        size_t a = cur.find_first_not_of(ws);
+        size_t b = cur.find_last_not_of(ws);
+        if (a != std::string::npos && b != std::string::npos && b >= a) {
+            out.push_back({cur.substr(a, b - a + 1), gap});
+        } else if (gap && !out.empty()) {
+            if (gap > out.back().gap_class) out.back().gap_class = gap;
+        }
+        cur.clear();
+    };
+    for (size_t i = 0; i < text.size();) {
+        unsigned char c = static_cast<unsigned char>(text[i]);
+        size_t len = 1;
+        if ((c & 0xE0) == 0xC0) len = 2;
+        else if ((c & 0xF0) == 0xE0) len = 3;
+        else if ((c & 0xF8) == 0xF0) len = 4;
+        if (i + len > text.size()) len = 1;
+        const std::string cp = text.substr(i, len);
+        int gap = 0;
+        if (cp == "\n" || cp == "\xE2\x80\xA9")         gap = 4;
+        else if (cp == "," || cp == "\xD8\x8C")         gap = 1;   // , ،
+        else if (cp == ";" || cp == ":" ||
+                 cp == "\xD8\x9B")                      gap = 2;   // ؛
+        else if (cp == "." || cp == "!" || cp == "?" ||
+                 cp == "\xD8\x9F" || cp == "\xDB\x94" ||
+                 cp == "\xE2\x80\xA6")                  gap = 3;   // ؟ ۔ …
+        if (gap) flush(gap); else cur += cp;
+        i += len;
+    }
+    flush(0);
+    return out;
+}
+
+static double gapSeconds(int gap_class) {
+    switch (gap_class) {
+        case 1:  return 0.18;   // ،  کوتاه
+        case 2:  return 0.28;   // ؛  :
+        case 3:  return 0.45;   // . ! ? ؟
+        case 4:  return 0.70;   // خط جدید / پاراگراف
+        default: return 0.0;
+    }
+}
+
+static SynthResult synthesize(const SynthConfig& cfg, const std::string& text,
+                              const std::string& output_path,
+                              std::vector<float>* audio_out = nullptr) {
+    std::vector<SynthSegment> segs = splitAtSeparators(text);
+    if (segs.size() <= 1) {
+        return synthesize_one(cfg, text, output_path, audio_out);
+    }
+
+    std::vector<float> all;
+    double norm = 0, ac = 0, voc = 0;
+    int done = 0, failed = 0;
+    for (size_t i = 0; i < segs.size(); ++i) {
+        std::vector<float> part;
+        SynthResult r = synthesize_one(cfg, segs[i].text, "", &part, /*quiet=*/true);
+        if (!r.ok || part.empty()) {
+            ++failed;
+            std::cerr << "[segment] no audio for: " << segs[i].text << std::endl;
+            continue;
+        }
+        all.insert(all.end(), part.begin(), part.end());
+        norm += r.norm_ms; ac += r.matcha_ms; voc += r.vocos_ms;
+        ++done;
+        // silence between pieces only (never inside one, never after the last)
+        if (i + 1 < segs.size()) {
+            const double g = gapSeconds(segs[i].gap_class);
+            if (g > 0) all.insert(all.end(), (size_t)(g * cfg.sample_rate), 0.0f);
+        }
+    }
+
+    SynthResult agg;
+    if (done == 0) {
+        agg.ok = false;
+        agg.error = "segmented synthesis produced no audio";
+        return agg;
+    }
+    const size_t total = all.size();
+    if (audio_out) {
+        *audio_out = std::move(all);
+    } else {
+        const std::string actual = output_path.empty() ? "output.wav" : output_path;
+        write_wav(actual, all, cfg.sample_rate);
+        agg.output_path = actual;
+    }
+    agg.ok = true;
+    agg.norm_ms = norm; agg.matcha_ms = ac; agg.vocos_ms = voc;
+    agg.duration_secs = total / (double)cfg.sample_rate;
+    agg.total_ms = (norm + ac + voc);
+    std::cout << "Segments: " << segs.size() << " ok=" << done << " failed=" << failed
+              << " -> " << agg.duration_secs << "s" << std::endl;
+    return agg;
 }
 
 // ============================================================================
