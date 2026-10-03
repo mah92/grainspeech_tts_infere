@@ -614,6 +614,10 @@ static std::vector<float> stretch_mel_time(const std::vector<float>& mel, int64_
 // ============================================================================
 // Core synthesis
 // ============================================================================
+// forward declarations: the definitions live further down, next to the segmenting front-end
+static void fadeEdges(std::vector<float>& v, int sample_rate);
+static void trimOnset(std::vector<float>& v, int sample_rate);
+
 static SynthResult synthesize_one(const SynthConfig& cfg, const std::string& text,
                                   const std::string& output_path,
                                   std::vector<float>* audio_out = nullptr,
@@ -799,6 +803,13 @@ static SynthResult synthesize_one(const SynthConfig& cfg, const std::string& tex
 
     std::vector<float> audio = vocos_istft(mag_data, x_data, y_data,
                                            n_fft, hop, (int)vocos_frames);
+
+    // Ali approved the «پ» sample (2026-10-03): the model's first phones carry a sharp attack
+    // transient which the ear reports as a «تیک», so every synthesized piece gets a 20 ms onset
+    // trim and a 30 ms raised-cosine ramp at both ends. Done HERE so all callers behave alike —
+    // including the screen-reader path, where each sentence is its own native call.
+    trimOnset(audio, cfg.sample_rate);
+    fadeEdges(audio, cfg.sample_rate);
     int64_t num_samples = (int64_t)audio.size();
     if (cfg.debug) std::cout << "Wave shape: [1, " << num_samples << "]" << std::endl;
 
