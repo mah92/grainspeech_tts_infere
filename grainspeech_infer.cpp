@@ -136,177 +136,6 @@ static int read_token_map(const std::string& filepath,
 // Each unknown phone is mapped onto the nearest symbol the model actually
 // carries (this symbol table has 69 English / 74 Persian phone symbols).
 // Anything still unknown is left in place and reported exactly as before.
-// ---------------------------------------------------------------------------
-static std::vector<std::string> normalize_phones_for_inventory(
-        const std::vector<std::string>& in,
-        const std::map<std::string, int>& token_to_id) {
-    // NOTE: symbol-table keys carry the leading '@' (phones_to_ids adds it), so
-    // every lookup here must add it too — forgetting this made the whole
-    // normalization a silent no-op on the first attempt.
-    auto has = [&](const std::string& k) {
-        std::string key = (!k.empty() && k[0] == '@') ? k : ("@" + k);
-        return token_to_id.find(key) != token_to_id.end();
-    };
-    auto split_prefix = [](const std::string& p, std::string& prefix, std::string& core) {
-        size_t c = p.find(':');
-        if (c == std::string::npos) { prefix.clear(); core = p; }
-        else { prefix = p.substr(0, c + 1); core = p.substr(c + 1); }
-    };
-    // strip leading primary ˈ (U+02C8 = CB 88) / secondary ˌ (U+02CC = CB 8C) marks
-    auto split_stress = [](const std::string& core, std::string& stress, std::string& rest) {
-        stress.clear();
-        rest = core;
-        for (;;) {
-            if (rest.size() >= 2
-                && static_cast<unsigned char>(rest[0]) == 0xCB
-                && (static_cast<unsigned char>(rest[1]) == 0x88
-                    || static_cast<unsigned char>(rest[1]) == 0x8C)) {
-                stress += rest.substr(0, 2);
-                rest.erase(0, 2);
-            } else {
-                break;
-            }
-        }
-    };
-
-    const std::string V_A = "a", V_E = "e", V_O = "o", V_I = "i", V_U = "u";
-    const std::string V_OPEN_O = "\xC9\x94";        // ɔ
-    const std::string P_I = "\xC9\xAA";             // ɪ
-    const std::string P_U = "\xCA\x8A";             // ʊ
-    const std::string P_SCHWA = "\xC9\x99";         // ə
-    const std::string P_LEN = "\xCB\x90";           // ː
-    const std::string S_PRIMARY = "\xCB\x88";       // ˈ
-    const std::string S_SECONDARY = "\xCB\x8C";     // ˌ
-
-    std::vector<std::string> out;
-    for (size_t i = 0; i < in.size(); ++i) {
-        std::string prefix, core;
-        split_prefix(in[i], prefix, core);
-        std::string stress, rest;
-        split_stress(core, stress, rest);
-
-        // 1) already a symbol the model knows
-        if (has(in[i])) { out.push_back(in[i]); continue; }
-
-        // 2) an espeak-split diphthong: ("ˈa","ɪ") -> "ˈaɪ", ("ˌe","ɪ") -> "ˌeɪ"
-        bool is_vowel_letter = (rest == V_A || rest == V_E || rest == V_O
-                                || rest == V_I || rest == V_U || rest == V_OPEN_O);
-        if (is_vowel_letter && i + 1 < in.size()) {
-            std::string np, ncore;
-            split_prefix(in[i + 1], np, ncore);
-            std::string nstress, nrest;
-            split_stress(ncore, nstress, nrest);
-            if (np == prefix && (nstress.empty() || nstress == stress)
-                && (nrest == P_I || nrest == P_U)) {
-                std::string merged = prefix + stress + rest + nrest;
-                if (has(merged)) { out.push_back(merged); ++i; continue; }
-                std::string bare = prefix + rest + nrest;
-                if (has(bare)) { out.push_back(bare); ++i; continue; }
-            }
-        }
-
-        // 3) near-miss substitutions (stress-preserving form first)
-        static const char* kSubs[][2] = {
-            {"\xE1\xB5\xBB", "\xC9\xAA"},                    // ᵻ  -> ɪ
-            {"\xC9\xA8",     "\xC9\xAA"},                    // ɨ  -> ɪ
-            {"\xC9\xBE",     "\xC9\xB9"},                    // ɾ  -> ɹ
-            {"r",            "\xC9\xB9"},                    // r  -> ɹ
-            {"\xC9\x90",     "\xC9\x99"},                    // ɐ  -> ə
-            {"\xC9\x92",     "\xC9\x94"},                    // ɒ  -> ɔ
-            {"\xCA\x8C",     "\xC9\x99"},                    // ʌ  -> ə
-            {"\xC9\x9C",     "\xC9\x9C\xCB\x90"},            // ɜ  -> ɜː
-            {"\xC9\x9A",     "\xC9\x99"},                    // ɚ  -> ə
-            {"\xC9\x9D",     "\xC9\x9C\xCB\x90"},            // ɝ  -> ɜː
-        };
-        if (rest.size() <= 3) {
-            bool done = false;
-            for (const auto& sub : kSubs) {
-                if (rest == sub[0]) {
-                    std::string cand = prefix + stress + sub[1];
-                    if (has(cand)) { out.push_back(cand); done = true; break; }
-                    std::string cand2 = prefix + sub[1];
-                    if (has(cand2)) { out.push_back(cand2); done = true; break; }
-                }
-            }
-            if (done) continue;
-        }
-
-        // 4) drop a trailing length mark (ɑː -> ɑ where only the short form exists)
-        if (rest.size() > 2 && rest.compare(rest.size() - 2, 2, P_LEN) == 0) {
-            std::string stripped = rest.substr(0, rest.size() - 2);
-            std::string cand = prefix + stress + stripped;
-            if (has(cand)) { out.push_back(cand); continue; }
-            std::string cand2 = prefix + stripped;
-            if (has(cand2)) { out.push_back(cand2); continue; }
-            std::string cand3 = prefix + stripped + P_LEN;
-            if (has(cand3)) { out.push_back(cand3); continue; }
-        }
-
-        // 5) a secondary-stressed vowel that only exists unstressed (ˌo -> o)
-        if (stress == S_SECONDARY) {
-            std::string bare = prefix + rest;
-            if (has(bare)) { out.push_back(bare); continue; }
-        }
-
-        // 6) split a vowel+schwa sequence (ɪə -> ɪ + ə) when both halves exist
-        if (rest.size() > 2 && rest.compare(rest.size() - 2, 2, P_SCHWA) == 0) {
-            std::string head = rest.substr(0, rest.size() - 2);
-            if (has(prefix + head) && has(prefix + P_SCHWA)) {
-                out.push_back(prefix + stress + head);
-                out.push_back(prefix + P_SCHWA);
-                continue;
-            }
-        }
-
-        // 7) STRIP_DIACRITICS: drop phonetic diacritics (palatalisation ʲ,
-        //    aspiration ʰ, nasalisation ̃, syllabic ̩ …) and retry — espeak emits
-        //    them for foreign words/URLs and the model's alphabet has none of them.
-        {
-            std::string stripped;
-            for (size_t k = 0; k < rest.size();) {
-                size_t len = 1;
-                unsigned char c0 = static_cast<unsigned char>(rest[k]);
-                if ((c0 & 0xE0) == 0xC0) len = 2;
-                else if ((c0 & 0xF0) == 0xE0) len = 3;
-                else if ((c0 & 0xF8) == 0xF0) len = 4;
-                if (k + len > rest.size()) len = 1;
-                std::string cp = rest.substr(k, len);
-                k += len;
-                static const char* kDiacritics[] = {
-                    "\xCA\xB0",  // ʰ
-                    "\xCA\xB2",  // ʲ
-                    "\xCA\xB7",  // ʷ
-                    "\xCB\xA4",  // ˤ
-                    "\xCB\xA0",  // ˠ
-                    "\xCB\x80",  // ˀ
-                    "\xCC\xA9",  // ̩
-                    "\xCC\xAF",  // ̯
-                    "\xCC\x83",  // ̃
-                    "\xCC\xA5",  // ̥
-                    "\xCA\xB1",  // ʱ
-                    "\xCA\xA1"   // ˡ
-                };
-                bool drop = false;
-                for (const char* d : kDiacritics) {
-                    if (cp == d) { drop = true; break; }
-                }
-                if (!drop) stripped += cp;
-            }
-            if (!stripped.empty() && stripped != rest) {
-                std::string cand = prefix + stress + stripped;
-                if (has(cand)) { out.push_back(cand); continue; }
-                std::string cand2 = prefix + stripped;
-                if (has(cand2)) { out.push_back(cand2); continue; }
-            }
-        }
-
-        // 8) still unknown — keep it; phones_to_ids reports and skips it
-        out.push_back(in[i]);
-        (void)S_PRIMARY;
-    }
-    return out;
-}
-
 static std::vector<int64_t> phones_to_ids(const std::vector<std::string>& phones,
                                           const std::map<std::string, int>& token_to_id,
                                           int& missing) {
@@ -469,7 +298,7 @@ static std::string json_get_str(const std::string& json, const std::string& key)
 // ============================================================================
 // Config and result types
 // ============================================================================
-struct SynthConfig {
+struct GrainSynthConfig {
     std::string acoustic_model;   // GrainSpeech phones -> mel (exported ONNX)
     std::string symbols_file;     // symbol table, one token per line (line number = id)
     std::string vocoder_model;
@@ -491,7 +320,7 @@ struct SynthConfig {
     bool debug = false;
 };
 
-struct SynthResult {
+struct GrainSynthResult {
     bool ok = false;
     std::string error;
     std::string output_path;
@@ -519,12 +348,11 @@ static std::map<std::string, int> g_token_to_id;
 static std::map<int, std::string> g_id_to_token;
 static NormalizeConfig g_norm_config;
 static Language g_mainlang;
-static std::string g_lang_tag = "fa";
 
 static std::unique_ptr<Ort::Session> g_acoustic_session;
 static std::unique_ptr<Ort::Session> g_vocoder_session;
 
-static bool load_all_models(const SynthConfig& cfg) {
+static bool load_all_models(const GrainSynthConfig& cfg) {
     if (g_models_loaded) return true;
 
     // Model paths are passed externally — validate before loading.
@@ -598,7 +426,6 @@ static bool load_all_models(const SynthConfig& cfg) {
         return false;
     }
 
-    g_lang_tag = (cfg.main_lang_str == "EN" || cfg.main_lang_str == "en") ? "en" : "fa";
     std::cout << "Loading GrainSpeech acoustic model: " << cfg.acoustic_model << std::endl;
     try {
         g_acoustic_session.reset(new Ort::Session(*g_env, cfg.acoustic_model.c_str(), g_session_opts));
@@ -616,6 +443,7 @@ static bool load_all_models(const SynthConfig& cfg) {
     }
 
     g_norm_config.espeak_data_path = cfg.espeak_data;
+    g_norm_config.symbols_file = cfg.symbols_file;   // ADR-049: mapping lives in NormalizeText
     g_norm_config.shakkelha_onnx   = cfg.shakkelha_onnx;
     g_norm_config.ezafe_model_onnx = cfg.ezafe_onnx;
     g_norm_config.ezafe_model_spiece = cfg.ezafe_spiece;
@@ -712,23 +540,24 @@ static void trimOnset(std::vector<float>& v, int sample_rate) {
     v.erase(v.begin(), v.begin() + cut);
 }
 
-static SynthResult synthesize_one(const SynthConfig& cfg, const std::string& text,
+static GrainSynthResult synthesize_one(const GrainSynthConfig& cfg, const std::string& text,
                                   const std::string& output_path,
                                   std::vector<float>* audio_out = nullptr,
                                   bool quiet = false) {
-    SynthResult result;
+    GrainSynthResult result;
     auto t_total_start = std::chrono::high_resolution_clock::now();
 
-    // the language can change per request (daemon serves FA and EN)
-    g_lang_tag = (cfg.main_lang_str == "EN" || cfg.main_lang_str == "en") ? "en" : "fa";
     g_mainlang = LanguageDetector::string_to_language(cfg.main_lang_str);
     std::string normalized_text;
     std::string ipa_text;
+    std::string phone_str;
 
     if (cfg.debug) std::cout << "Normalizing text: " << text << std::endl;
     auto t_norm_start = std::chrono::high_resolution_clock::now();
-    normalizeString(g_mainlang, 1 /* IPA mode */, text,
-                    normalized_text, ipa_text, g_norm_config);
+    // ADR-048: the library returns the GrainSpeech phone stream itself, tagged PER SEGMENT
+    // (fa:/en:), the same way the training-data tool produces it. The engine no longer decides a
+    // language for the whole utterance.
+    normalizeToTaggedPhones(g_mainlang, text, g_norm_config, phone_str, &ipa_text, &normalized_text);
     auto t_norm_end = std::chrono::high_resolution_clock::now();
 
     ipa_text.erase(std::remove(ipa_text.begin(), ipa_text.end(), '\n'), ipa_text.end());
@@ -744,16 +573,18 @@ static SynthResult synthesize_one(const SynthConfig& cfg, const std::string& tex
     // --- GrainSpeech acoustic model: NormalizeText phones -> mel ---
     if (cfg.debug) std::cout << "\n=== GrainSpeech acoustic model ===" << std::endl;
 
-    std::string phone_str = grain::toModelPhones(normalized_text, ipa_text, g_lang_tag);
+    if (phone_str.empty()) {
+        std::cerr << "Warning: NormalizeText produced no tagged phones" << std::endl;
+    }
     std::vector<std::string> phones;
     {
         std::istringstream ss(phone_str);
         std::string tk;
         while (ss >> tk) phones.push_back(tk);
     }
-    // map espeak-only phones onto symbols the model carries, so a word is not
-    // silently truncated by a missing symbol (see the function above)
-    phones = normalize_phones_for_inventory(phones, g_token_to_id);
+    // ADR-049 (2026-10-08, Ali): the phone->inventory mapping lives INSIDE NormalizeText now and is
+    // applied to every segment there, so the tagged stream that arrives here is already inside the
+    // model's alphabet. Whatever is still unknown is counted below and skipped by phones_to_ids.
     if (cfg.debug) {
         std::string np;
         for (size_t k = 0; k < phones.size(); ++k) { if (k) np += " "; np += phones[k]; }
@@ -1027,7 +858,7 @@ static double gapSeconds(int gap_class) {
 // waveform ends at a non-zero value and the very next sample is digital silence. A 5 ms ramp on
 // both edges of every piece removes it (measured: the edge jump fell from 3024 to 22).
 
-static SynthResult synthesize(const SynthConfig& cfg, const std::string& text,
+static GrainSynthResult synthesize(const GrainSynthConfig& cfg, const std::string& text,
                               const std::string& output_path,
                               std::vector<float>* audio_out = nullptr) {
     std::vector<SynthSegment> segs = splitAtSeparators(text);
@@ -1040,7 +871,7 @@ static SynthResult synthesize(const SynthConfig& cfg, const std::string& text,
     int done = 0, failed = 0;
     for (size_t i = 0; i < segs.size(); ++i) {
         std::vector<float> part;
-        SynthResult r = synthesize_one(cfg, segs[i].text, "", &part, /*quiet=*/true);
+        GrainSynthResult r = synthesize_one(cfg, segs[i].text, "", &part, /*quiet=*/true);
         if (!r.ok || part.empty()) {
             ++failed;
             std::cerr << "[segment] no audio for: " << segs[i].text << std::endl;
@@ -1049,14 +880,23 @@ static SynthResult synthesize(const SynthConfig& cfg, const std::string& text,
         all.insert(all.end(), part.begin(), part.end());
         norm += r.norm_ms; ac += r.matcha_ms; voc += r.vocos_ms;
         ++done;
-        // silence between pieces only (never inside one, never after the last)
+        // silence between pieces only (never inside one, never after the last).
+        // cfg.sample_rate has been observed corrupted on the device (6029312 / negative), which
+        // turned a 0.18 s pause into ~1 085 276 samples of silence per separator — minutes of
+        // silence that the ear reports as «صدا قطع شد». Validate the rate and bound the pause.
         if (i + 1 < segs.size()) {
             const double g = gapSeconds(segs[i].gap_class);
-            if (g > 0) all.insert(all.end(), (size_t)(g * cfg.sample_rate), 0.0f);
+            const int gap_rate = (cfg.sample_rate >= 8000 && cfg.sample_rate <= 48000)
+                                     ? cfg.sample_rate : 16000;
+            if (g > 0 && g <= 1.0) {
+                all.insert(all.end(), (size_t)(g * gap_rate), 0.0f);
+            } else if (g > 1.0) {
+                GRAIN_LOGI("gapSeconds(%d) returned %.3f s — ignoring (bounds)", segs[i].gap_class, g);
+            }
         }
     }
 
-    SynthResult agg;
+    GrainSynthResult agg;
     if (done == 0) {
         agg.ok = false;
         agg.error = "segmented synthesis produced no audio";
@@ -1118,7 +958,7 @@ static bool write_line(int fd, const std::string& line) {
 // ============================================================================
 // DAEMON MODE
 // ============================================================================
-static int run_daemon(const SynthConfig& cfg) {
+static int run_daemon(const GrainSynthConfig& cfg) {
     signal(SIGPIPE, SIG_IGN);
 
     std::cout << "[DAEMON] Loading all models..." << std::endl;
@@ -1184,7 +1024,7 @@ static int run_daemon(const SynthConfig& cfg) {
             continue;
         }
 
-        SynthConfig req_cfg = cfg;
+        GrainSynthConfig req_cfg = cfg;
         std::string temp_str = json_get_str(request, "temperature");
         if (!temp_str.empty()) req_cfg.temperature = std::stof(temp_str);
         std::string speed_str = json_get_str(request, "speed");
@@ -1197,7 +1037,7 @@ static int run_daemon(const SynthConfig& cfg) {
         std::string output = json_get_str(request, "output");
         if (output.empty()) output = "output.wav";
 
-        SynthResult result = synthesize(req_cfg, text, output);
+        GrainSynthResult result = synthesize(req_cfg, text, output);
 
         char buf[4096];
         if (result.ok) {
@@ -1265,7 +1105,7 @@ static bool daemon_is_running() {
     return running;
 }
 
-static int run_client(const SynthConfig& cfg, const std::string& text,
+static int run_client(const GrainSynthConfig& cfg, const std::string& text,
                        const std::string& output_path, bool play_audio) {
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) { perror("socket"); return 1; }
@@ -1345,7 +1185,7 @@ int main(int argc, char* argv[]) {
     std::locale::global(std::locale("en_US.UTF-8"));
 
     // ----- Paths (passed externally via CLI — no hardcoded defaults) -----
-    SynthConfig cfg;
+    GrainSynthConfig cfg;
     // Model paths: REQUIRED via CLI flags (--matcha-model, --vocoder-model,
     // --tokens, --espeak-data). The caller (tts.py) passes them explicitly.
     // NormalizeText assets live relative to the binary (./assets/) — these
@@ -1435,7 +1275,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    SynthResult result = synthesize(cfg, text, output_wav);
+    GrainSynthResult result = synthesize(cfg, text, output_wav);
     if (!result.ok) {
         std::cerr << "Error: " << result.error << std::endl;
         return 1;
