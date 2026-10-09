@@ -352,7 +352,29 @@ static Language g_mainlang;
 static std::unique_ptr<Ort::Session> g_acoustic_session;
 static std::unique_ptr<Ort::Session> g_vocoder_session;
 
+
+// Identity of a model file for logcat: app-private paths are unreadable from adb, so the engine
+// reports what it really loaded (size + FNV-1a 64 of the bytes).
+static void logModelFingerprint(const char* what, const std::string& path) {
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) { GRAIN_LOGI("model[%s] MISSING: %s", what, path.c_str()); return; }
+    unsigned long long h = 1469598103934665603ULL;   // FNV-1a 64
+    size_t n = 0;
+    unsigned char buf[65536];
+    size_t got;
+    while ((got = std::fread(buf, 1, sizeof(buf), f)) > 0) {
+        for (size_t i = 0; i < got; ++i) { h ^= (unsigned long long)buf[i]; h *= 1099511628211ULL; }
+        n += got;
+    }
+    std::fclose(f);
+    GRAIN_LOGI("model[%s] path=%s size=%zu fnv1a64=%016llx", what, path.c_str(), n, h);
+}
+
 static bool load_all_models(const GrainSynthConfig& cfg) {
+    logModelFingerprint("acoustic", cfg.acoustic_model);
+    logModelFingerprint("vocoder", cfg.vocoder_model);
+    logModelFingerprint("symbols", cfg.symbols_file);
+
     if (g_models_loaded) return true;
 
     // Model paths are passed externally — validate before loading.
