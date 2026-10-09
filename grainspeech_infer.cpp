@@ -524,7 +524,7 @@ static void fadeEdges(std::vector<float>& v, int sample_rate) {
 // GRAIN_TRIM_ONSET_MS > 0 drops that much audio from the start of every piece: the model's first
 // phones carry a sharp attack transient which is exactly what the ear reports as a «تیک».
 static void trimOnset(std::vector<float>& v, int sample_rate) {
-    const double ms = envSeconds("GRAIN_TRIM_ONSET_MS", 20.0);
+    const double ms = envSeconds("GRAIN_TRIM_ONSET_MS", 35.0);
     if (ms <= 0.0 || v.empty()) return;
     if (sample_rate <= 0) return;                       // never guess a rate
     const size_t wanted = (size_t)(ms * 0.001 * (double)sample_rate);
@@ -751,7 +751,7 @@ static GrainSynthResult synthesize_one(const GrainSynthConfig& cfg, const std::s
     fadeEdges(audio, eff_rate);
     GRAIN_LOGI("after trim/fade: samples=%d (sr=%d, trim_ms=%.1f, fade_ms=%.1f)",
                (int)audio.size(), cfg.sample_rate,
-               envSeconds("GRAIN_TRIM_ONSET_MS", 20.0), envSeconds("GRAIN_FADE_MS", 30.0));
+               envSeconds("GRAIN_TRIM_ONSET_MS", 35.0), envSeconds("GRAIN_FADE_MS", 30.0));
     int64_t num_samples = (int64_t)audio.size();
     if (cfg.debug) std::cout << "Wave shape: [1, " << num_samples << "]" << std::endl;
 
